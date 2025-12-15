@@ -1,4 +1,5 @@
 import os
+import traceback
 import requests
 
 from selenium import webdriver
@@ -6,7 +7,8 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 
-VERSION = "cekdapa-v1"
+
+VERSION = "cekdapa-v2"
 TARGET_URL = "https://cekdapa.com/cek-nawala/"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -15,15 +17,22 @@ DOMAINS_ENV = os.environ.get("DOMAINS_TO_CHECK", "")
 
 
 def send_telegram(text: str):
+    """Kirim pesan Telegram (plain text)."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram env belum di-set")
+        print("Telegram env belum di-set", flush=True)
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
-
-    resp = requests.post(url, json=payload, timeout=20)
-    print("Telegram resp:", resp.status_code, resp.text[:200])
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=20)
+        print("Telegram resp:", resp.status_code, resp.text[:200], flush=True)
+    except Exception as e:
+        print("Gagal kirim Telegram:", e, flush=True)
 
 
 def setup_driver():
@@ -32,6 +41,7 @@ def setup_driver():
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
+    options.add_argument("--disable-extensions")
     options.add_argument("--window-size=1280,720")
     driver = webdriver.Chrome(options=options)
     driver.set_page_load_timeout(60)
@@ -41,23 +51,20 @@ def setup_driver():
 def load_domains():
     if not DOMAINS_ENV.strip():
         return []
-
     raw = DOMAINS_ENV.replace("\n", ",")
     parts = [p.strip() for p in raw.split(",")]
-    domains = [p for p in parts if p]
-    return domains
+    return [p for p in parts if p]
 
 
 def chunk(lst, n):
     for i in range(0, len(lst), n):
-        yield lst[i:i+n]
+        yield lst[i:i + n]
 
 
 def normalize_input(dom: str) -> str:
     """
-    Cekdapa menerima URL/domain.
-    Dari screenshot kamu pakai https://domain
-    Jadi kita rapikan: kalau user input domain saja, kita tambahkan https://
+    CekDAPA menerima URL/Domain. Supaya konsisten:
+    - Jika input belum ada http/https -> tambahkan https://
     """
     d = dom.strip()
     if not d:
@@ -68,40 +75,70 @@ def normalize_input(dom: str) -> str:
 
 
 def row_is_blocked(cells_text: list[str]) -> bool:
-    """
-    Jika ada sel yang mengandung kata 'Terblokir' -> dianggap blocked.
-    """
+    """Jika ada sel mengandung 'Terblokir' maka blocked."""
     for t in cells_text:
         if "terblokir" in (t or "").strip().lower():
             return True
     return False
 
 
+def find_button_cek_nawala(driver):
+    """
+    Tombol bisa berupa <button>, <a>, atau <input>.
+    Cari elemen yang visible dan mengandung teks/value 'Cek Nawala'.
+    """
+    # 1) button / a yang berisi teks
+    candidates = driver.find_elements(
+        By.XPATH,
+        "//*[self::button or self::a][contains(normalize-space(.), 'Cek Nawala')]"
+    )
+    for el in candidates:
+        try:
+            if el.is_displayed() and el.is_enabled():
+                return el
+        except Exception:
+            pass
+
+    # 2) input type submit/button yang value-nya "Cek Nawala"
+    candidates = driver.find_elements(
+        By.XPATH,
+        "//input[(translate(@value,'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ')='CEK NAWALA') "
+        "or contains(translate(@value,'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'CEK NAWALA')]"
+    )
+    for el in candidates:
+        try:
+            if el.is_displayed() and el.is_enabled():
+                return el
+        except Exception:
+            pass
+
+    raise RuntimeError("Tombol 'Cek Nawala' tidak ditemukan")
+
+
 def check_batch_cekdapa(driver, domains_batch: list[str]) -> dict:
     """
     Return dict:
-      key: domain tanpa protokol (misal boxing55a.live)
-      value: (blocked_bool, detail_cells)
+      key: domain tanpa protokol (lowercase)
+      value: blocked_bool
     """
     driver.get(TARGET_URL)
     wait = WebDriverWait(driver, 40)
 
-    # 1) cari textarea input (di halaman ini biasanya hanya satu)
+    wait.until(lambda d: d.find_element(By.TAG_NAME, "body"))
+
+    # textarea pertama di halaman
     textarea = wait.until(lambda d: d.find_element(By.TAG_NAME, "textarea"))
     textarea.clear()
     textarea.send_keys("\n".join(normalize_input(x) for x in domains_batch))
 
-    # 2) klik tombol "Cek Nawala"
-    btn = wait.until(
-        lambda d: d.find_element(By.XPATH, "//button[contains(., 'Cek Nawala')]")
-    )
+    # klik tombol
+    btn = wait.until(lambda d: find_button_cek_nawala(d))
     btn.click()
 
-    # 3) tunggu tabel "Hasil Cek" muncul
-    # kita cari baris tabel setelah judul "Hasil Cek"
-    wait.until(lambda d: len(d.find_elements(By.XPATH, "//h2[contains(.,'Hasil Cek')]/following::table[1]//tbody/tr")) > 0)
+    # tunggu tabel hasil muncul (cara umum)
+    wait.until(lambda d: len(d.find_elements(By.CSS_SELECTOR, "table tbody tr")) > 0)
 
-    rows = driver.find_elements(By.XPATH, "//h2[contains(.,'Hasil Cek')]/following::table[1]//tbody/tr")
+    rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
     results = {}
 
     for row in rows:
@@ -110,12 +147,16 @@ def check_batch_cekdapa(driver, domains_batch: list[str]) -> dict:
             continue
 
         domain_text = tds[0].text.strip()
-        # domain kadang tampil tanpa https://, kita bikin key yang konsisten:
-        key = domain_text.replace("https://", "").replace("http://", "").strip().lower()
+        key = (
+            domain_text.replace("https://", "")
+            .replace("http://", "")
+            .strip()
+            .lower()
+        )
 
-        cells = [td.text.strip() for td in tds[1:]]  # kolom status provider
+        cells = [td.text.strip() for td in tds[1:]]
         blocked = row_is_blocked(cells)
-        results[key] = (blocked, cells)
+        results[key] = blocked
 
     return results
 
@@ -123,23 +164,46 @@ def check_batch_cekdapa(driver, domains_batch: list[str]) -> dict:
 def main():
     domains = load_domains()
     if not domains:
-        send_telegram(f"Domain Status Report ({VERSION})\nTidak ada domain untuk dicek.")
+        send_telegram(f"Domain Status Report (cekdapa) [{VERSION}]\nTidak ada domain untuk dicek.")
         return
 
     driver = setup_driver()
-    final = {}
+    final_results = {}
 
     try:
-        # cekdapa max 5 per request
+        # cekdapa max 5 domain per request
         for batch in chunk(domains, 5):
             batch_res = check_batch_cekdapa(driver, batch)
-            final.update(batch_res)
+            final_results.update(batch_res)
+
     except Exception as e:
+        # debug lengkap ke logs
+        print("=== ERROR ===", flush=True)
+        print("VERSION:", VERSION, flush=True)
+        try:
+            print("Current URL:", driver.current_url, flush=True)
+            print("Title:", driver.title, flush=True)
+        except Exception:
+            pass
+        print("ERROR TYPE:", type(e).__name__, flush=True)
+        print("ERROR MSG:", str(e), flush=True)
+        traceback.print_exc()
+
+        # screenshot & html untuk investigasi (kalau environment mengizinkan)
+        try:
+            driver.save_screenshot("/tmp/cekdapa_error.png")
+            with open("/tmp/cekdapa_error.html", "w", encoding="utf-8") as f:
+                f.write(driver.page_source)
+            print("Saved debug: /tmp/cekdapa_error.png and /tmp/cekdapa_error.html", flush=True)
+        except Exception as e2:
+            print("Gagal simpan debug file:", e2, flush=True)
+
         try:
             driver.quit()
         except Exception:
             pass
-        send_telegram(f"❌ Gagal cek (cekdapa) [{VERSION}]: {e}")
+
+        send_telegram(f"❌ Gagal cek (cekdapa) [{VERSION}]: {type(e).__name__}: {e}")
         return
 
     try:
@@ -151,11 +215,8 @@ def main():
 
     for d in domains:
         key = d.strip().lower().replace("https://", "").replace("http://", "")
-        blocked, _cells = final.get(key, (False, []))
-        if blocked:
-            lines.append(f"{key}: 🔴 Blocked")
-        else:
-            lines.append(f"{key}: 🟢 Not Blocked")
+        blocked = final_results.get(key, False)
+        lines.append(f"{key}: {'🔴 Blocked' if blocked else '🟢 Not Blocked'}")
 
     send_telegram("\n".join(lines))
 
